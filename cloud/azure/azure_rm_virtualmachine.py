@@ -209,6 +209,25 @@ options:
             - Any other input will be ignored
         default: ['all']
         required: false
+    availability_set:
+        description:
+            - Name of the existing availability set that will be assigned for the VM.
+        default: null
+        required: false
+        version_added: "2.2"
+    boot_diagnostics:
+        description:
+            - Use boot diagnostics.
+        default: false
+        required: false
+        version_added: "2.2"
+    diagnostic_storage_account_name:
+        description:
+            - Name of an existing storage account that supports creation of VHD blobs. If not specified for a new VM,
+              a new storage account named <vm name>XXXX (where XXXX is a random number) will be created using storage type 'Standard_LRS'.
+        default: null
+        required: false
+        version_added: "2.2"
 
 extends_documentation_fragment:
     - azure
@@ -446,7 +465,9 @@ try:
                                           StorageProfile, OSProfile, OSDisk, \
                                           VirtualHardDisk, ImageReference,\
                                           NetworkProfile, LinuxConfiguration, \
-                                          SshConfiguration, SshPublicKey
+                                          SshConfiguration, SshPublicKey, \
+                                          DiagnosticsProfile, BootDiagnostics, \
+                                          SubResource
     from azure.mgmt.network.models import PublicIPAddress, NetworkSecurityGroup, NetworkInterface, \
                                           NetworkInterfaceIPConfiguration, Subnet
     from azure.mgmt.storage.models import StorageAccountCreateParameters, Sku
@@ -503,6 +524,9 @@ class AzureRMVirtualMachine(AzureRMModuleBase):
             allocated=dict(type='bool', default=True),
             restarted=dict(type='bool', default=False),
             started=dict(type='bool', default=True),
+            availability_set=dict(type='str'),
+            boot_diagnostics=dict(type='bool', default=False),
+            diagnostic_storage_account_name=dict(type='str'),
         )
 
         for key in VirtualMachineSizeTypes:
@@ -535,7 +559,10 @@ class AzureRMVirtualMachine(AzureRMModuleBase):
         self.allocated = None
         self.restarted = None
         self.started = None
+        self.availability_set = None
         self.differences = None
+        self.boot_diagnostics = None
+        self.diagnostic_storage_account_name = None
 
         self.results = dict(
             changed=False,
@@ -561,6 +588,7 @@ class AzureRMVirtualMachine(AzureRMModuleBase):
         vm = None
         network_interfaces = []
         requested_vhd_uri = None
+        requested_diagnostic_storage_uri = None
         disable_ssh_password = None
         vm_dict = None
 
@@ -609,6 +637,11 @@ class AzureRMVirtualMachine(AzureRMModuleBase):
                 requested_vhd_uri = 'https://{0}.blob.core.windows.net/{1}/{2}'.format(self.storage_account_name,
                                                                                        self.storage_container_name,
                                                                                        self.storage_blob_name)
+
+            if self.boot_diagnostics and self.diagnostic_storage_account_name:
+                    self.get_storage_account(self.diagnostic_storage_account_name)
+
+                    requested_diagnostic_storage_uri = 'https://{0}.blob.core.windows.net/'.format(self.diagnostic_storage_account_name)
 
             disable_ssh_password = not self.ssh_password_enabled
 
@@ -727,11 +760,24 @@ class AzureRMVirtualMachine(AzureRMModuleBase):
                             self.storage_container_name,
                             self.storage_blob_name)
 
+                    if self.boot_diagnostics and not self.diagnostic_storage_account_name:
+                        diagnostic_storage_account = self.create_default_storage_account()
+                        self.log("diagnostic_storage account:")
+                        self.log(self.serialize_obj(diagnostic_storage_account, 'StorageAccount'), pretty_print=True)
+                        requested_diagnostic_storage_uri = 'https://{0}.blob.core.windows.net/'.format(diagnostic_storage_account.name)
+
                     if not self.short_hostname:
                         self.short_hostname = self.name
 
                     nics = [NetworkInterfaceReference(id=id) for id in network_interfaces]
                     vhd = VirtualHardDisk(uri=requested_vhd_uri)
+
+                    availability_sets_resource = None
+                    if self.availability_set:
+                        availability_sets_resource = self.compute_client.availability_sets.get(self.resource_group, self.availability_set)
+                        self.log("availability_set:")
+                        self.log(self.serialize_obj(availability_sets_resource, 'AvailabilitySet'), pretty_print=True)
+
                     vm_resource = VirtualMachine(
                         self.location,
                         tags=self.tags,
@@ -760,6 +806,16 @@ class AzureRMVirtualMachine(AzureRMModuleBase):
                             network_interfaces=nics
                         ),
                     )
+
+                    if self.boot_diagnostics:
+                        self.log("Using diagnostic storage %s" % requested_diagnostic_storage_uri)
+                        vm_resource.diagnostics_profile = DiagnosticsProfile(
+                            boot_diagnostics=BootDiagnostics(enabled=self.boot_diagnostics, storage_uri=requested_diagnostic_storage_uri)
+                        )
+
+                    if availability_sets_resource:
+                        self.log("Using availability set: " + availability_sets_resource.id)
+                        vm_resource.availability_set = SubResource(id=availability_sets_resource.id)
 
                     if self.admin_password:
                         vm_resource.os_profile.admin_password = self.admin_password

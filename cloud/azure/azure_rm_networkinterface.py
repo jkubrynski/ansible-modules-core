@@ -136,6 +136,27 @@ options:
         type: list
         required: false
         default: null
+    load_balancer_name:
+        description:
+            - Name of the load balancer to associate
+        required: false
+        default: null
+        version_added: "2.2"
+    load_balancer_backend_pool_names:
+        description:
+            - List of the load balancer's backend pool names. Used only when load_balancer_name is specified
+        type: list
+        required: false
+        default: null
+        version_added: "2.2"
+    load_balancer_nat_rule_names:
+        description:
+            - List of the load balancer's nat rule names. Used only when load_balancer_name is specified
+        type: list
+        required: false
+        default: null
+        version_added: "2.2"
+
 extends_documentation_fragment:
     - azure
     - azure_tags
@@ -228,7 +249,7 @@ from ansible.module_utils.azure_rm_common import *
 try:
     from msrestazure.azure_exceptions import CloudError
     from azure.mgmt.network.models import NetworkInterface, NetworkInterfaceIPConfiguration, Subnet, \
-                                          PublicIPAddress, NetworkSecurityGroup
+        PublicIPAddress, NetworkSecurityGroup, LoadBalancer, BackendAddressPool, InboundNatRule
 except ImportError:
     # This is handled in azure_rm_common
     pass
@@ -281,6 +302,16 @@ def nic_to_dict(nic):
         id_keys = azure_id_to_dict(nic.ip_configurations[0].public_ip_address.id)
         result['ip_configuration']['public_ip_address']['name'] = id_keys['publicIPAddresses']
 
+    if nic.ip_configurations[0].load_balancer_backend_address_pools:
+        result['ip_configuration']['load_balancer_backend_address_pools'] = []
+        for pool in nic.ip_configurations[0].load_balancer_backend_address_pools:
+            result['ip_configuration']['load_balancer_backend_address_pools'].append(pool.id)
+
+    if nic.ip_configurations[0].load_balancer_inbound_nat_rules:
+        result['ip_configuration']['load_balancer_inbound_nat_rules'] = []
+        for rule in nic.ip_configurations[0].load_balancer_inbound_nat_rules:
+            result['ip_configuration']['load_balancer_inbound_nat_rules'].append(rule.id)
+
     return result
 
 
@@ -303,6 +334,9 @@ class AzureRMNetworkInterface(AzureRMModuleBase):
             os_type=dict(type='str', choices=['Windows', 'Linux'], default='Linux'),
             open_ports=dict(type='list'),
             public_ip_allocation_method=dict(type='str', choices=['Dynamic', 'Static'], default='Dynamic'),
+            load_balancer_name=dict(type='str'),
+            load_balancer_backend_pool_names=dict(type='list'),
+            load_balancer_nat_rule_names=dict(type='list'),
         )
 
         self.resource_group = None
@@ -321,6 +355,9 @@ class AzureRMNetworkInterface(AzureRMModuleBase):
         self.open_ports = None
         self.public_ip_allocation_method = None
         self.public_ip = None
+        self.load_balancer_name = None
+        self.load_balancer_backend_pool_names = None
+        self.load_balancer_nat_rule_names = None
 
         self.results = dict(
             changed=False,
@@ -414,6 +451,37 @@ class AzureRMNetworkInterface(AzureRMModuleBase):
                         results['ip_configuration']['subnet']['name'] = subnet.name
                         results['ip_configuration']['subnet']['virtual_network_name'] = self.virtual_network_name
 
+                if self.load_balancer_name:
+                    lb = self.network_client.load_balancers.get(self.resource_group, self.load_balancer_name)
+                    self.log('Found load balancer {0}'.format(lb))
+                    if self.load_balancer_backend_pool_names:
+                        if not results['ip_configuration'].get('load_balancer_backend_address_pools'):
+                            results['ip_configuration']['load_balancer_backend_address_pools'] = []
+                        for pool_name in self.load_balancer_backend_pool_names:
+                            for pool in lb.backend_address_pools:
+                                if pool.name == pool_name:
+                                    matched = False
+                                    for nic_pool in results['ip_configuration']['load_balancer_backend_address_pools']:
+                                        if nic_pool == pool.id:
+                                            matched = True
+                                    if not matched:
+                                        changed = True
+                                        results['ip_configuration']['load_balancer_backend_address_pools'].append(pool.id)
+
+                    if self.load_balancer_nat_rule_names:
+                        if not results['ip_configuration'].get('load_balancer_inbound_nat_rules'):
+                            results['ip_configuration']['load_balancer_inbound_nat_rules'] = []
+                        for nat_rule_name in self.load_balancer_nat_rule_names:
+                            for nat_rule in lb.inbound_nat_rules:
+                                if nat_rule.name == nat_rule_name:
+                                    matched = False
+                                    for nic_nat_rule in results['ip_configuration']['load_balancer_inbound_nat_rules']:
+                                        if nic_nat_rule == nat_rule.id:
+                                            matched = True
+                                    if not matched:
+                                        changed = True
+                                        results['ip_configuration']['load_balancer_inbound_nat_rules'].append(nat_rule.id)
+
             elif self.state == 'absent':
                 self.log("CHANGED: network interface {0} exists but requested state is 'absent'".format(self.name))
                 changed = True
@@ -475,6 +543,23 @@ class AzureRMNetworkInterface(AzureRMModuleBase):
                             id=pip.id,
                             location=pip.location,
                             resource_guid=pip.resource_guid)
+
+                    if self.load_balancer_name:
+                        lb = self.network_client.load_balancers.get(self.resource_group, self.load_balancer_name)
+                        self.log('Found load balancer {0}'.format(lb))
+                        if self.load_balancer_backend_pool_names:
+                            nic.ip_configurations[0].load_balancer_backend_address_pools = []
+                            for pool_name in self.load_balancer_backend_pool_names:
+                                for pool in lb.backend_address_pools:
+                                    if pool.name == pool_name:
+                                        nic.ip_configurations[0].load_balancer_backend_address_pools.append(pool)
+                        if self.load_balancer_nat_rule_names:
+                            nic.ip_configurations[0].load_balancer_inbound_nat_rules = []
+                            for nat_rule_name in self.load_balancer_nat_rule_names:
+                                for nat_rule in lb.inbound_nat_rules:
+                                    if nat_rule.name == nat_rule_name:
+                                        nic.ip_configurations[0].load_balancer_inbound_nat_rules.append(nat_rule)
+
                 else:
                     self.log("Updating network interface {0}.".format(self.name))
                     nic = NetworkInterface(
@@ -511,6 +596,16 @@ class AzureRMNetworkInterface(AzureRMModuleBase):
                         nic.network_security_group = NetworkSecurityGroup(id=nsg.id,
                                                                           location=nsg.location,
                                                                           resource_guid=nsg.resource_guid)
+
+                    if results['ip_configuration']['load_balancer_backend_address_pools']:
+                        nic.ip_configurations[0].load_balancer_backend_address_pools = []
+                        for pool_id in results['ip_configuration']['load_balancer_backend_address_pools']:
+                            nic.ip_configurations[0].load_balancer_backend_address_pools.append(BackendAddressPool(id=pool_id))
+
+                    if results['ip_configuration']['load_balancer_inbound_nat_rules']:
+                        nic.ip_configurations[0].load_balancer_inbound_nat_rules = []
+                        for nat_rule_id in results['ip_configuration']['load_balancer_inbound_nat_rules']:
+                            nic.ip_configurations[0].load_balancer_inbound_nat_rules.append(InboundNatRule(id=nat_rule_id))
 
                 # See what actually gets sent to the API
                 request = self.serialize_obj(nic, 'NetworkInterface')
